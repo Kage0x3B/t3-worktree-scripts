@@ -28,6 +28,10 @@ up for this repo:
 5. Commit on a new branch and tell me what to review.
 ```
 
+**Repo already set up?** If it has a `wt.sh` and `t3.json` checked in, you need nothing from here:
+the project's `wt.sh` uses its own vendored `wt-lib.sh`. Installing this repo only adds the
+cross-project `wt status` / `wt gc` overview (step 1 of the prompt) and `wt sync` for updates.
+
 The manual steps follow below if you prefer to do it by hand.
 
 Per worktree you get:
