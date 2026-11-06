@@ -4,6 +4,8 @@ Every [T3 Code](https://t3.codes) thread in worktree mode gets its own git workt
 turn each worktree into its own isolated dev instance, so several agents can run the backend and
 frontends at the same time without fighting over ports, the database or the login cookie.
 
+**Linux only for now** — see [macOS](#requirements).
+
 Per worktree you get:
 
 - **A slot** (1, 2, 3 …) with its own port block. The main checkout stays slot 0 and keeps its ports.
@@ -24,8 +26,23 @@ Per worktree you get:
 
 ## Requirements
 
-Linux (uses `/proc`, `ss`, `flock`, `ip`), bash, git, Docker with the dev Postgres in a container,
-Python 3 for `wt`. macOS is not supported as is.
+Linux, bash 4.4+, git, Docker with the dev Postgres in a container, Python 3 for `wt`.
+
+> [!WARNING]
+> **macOS is not supported yet.** The scripts rely on Linux-only tools, and some parts would fail
+> *silently* on a Mac rather than with an error. Don't use them on macOS until they are ported.
+
+| Linux dependency | Used for | On macOS |
+| --- | --- | --- |
+| `flock` | slot allocation lock | missing: `setup` aborts |
+| `sha1sum` | worktree id hash | missing (`shasum` instead): `setup` aborts |
+| `/proc/<pid>/cwd` | finding a worktree's dev servers (`stop`, `settle`, `teardown`, `wt status`) | missing: `stop` finds nothing and reports success while servers keep running |
+| `ss` | which slot ports are listening | missing: `teardown` can't see running servers and drops the DB under them |
+| `ip` | LAN IPs for CORS origins | missing: only localhost origins (harmless) |
+| bash 3.2 (macOS default) | | empty arrays under `set -u` abort; needs Homebrew bash |
+
+With Homebrew's `flock` and `coreutils` installed, `setup` gets through, and the silent failures
+in the `/proc` and `ss` rows are what's left. A port means swapping those calls for `lsof`/`ps`.
 
 ## Install
 
