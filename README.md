@@ -6,6 +6,30 @@ frontends at the same time without fighting over ports, the database or the logi
 
 Works on Linux and macOS (macOS tested in CI only, via Homebrew Postgres; Docker Desktop not tested).
 
+## Install with Claude
+
+Open Claude Code (or a T3 Code thread in local mode, not worktree mode) in the repo you want to
+set up and paste:
+
+```text
+Install the T3 worktree scripts from https://github.com/Kage0x3B/t3-worktree-scripts and set them
+up for this repo:
+
+1. Clone it to ~/dev/t3-worktree-scripts (or `git pull` if it is already there). Symlink
+   wt/wt into ~/.local/bin (or another dir on my PATH) and skill/t3-worktree-setup into
+   ~/.claude/skills/. Run `wt --help` to check the install.
+2. Read the README and the skill, then follow the skill for this repo: survey the apps,
+   services, env files, cookies, crons and outbound integrations first and show me what you
+   found before writing anything.
+3. Vendor wt/wt-lib.sh, write scripts/worktree/wt.sh from examples/wt.sh and a t3.json from
+   examples/t3.json, and make the apps read the slot's ports, DB name and cookie name.
+4. Verify in a real worktree as the skill's checklist describes. Never touch the main
+   checkout's database or running dev servers.
+5. Commit on a new branch and tell me what to review.
+```
+
+The manual steps follow below if you prefer to do it by hand.
+
 Per worktree you get:
 
 - **A slot** (1, 2, 3 …) with its own port block. The main checkout stays slot 0 and keeps its ports.
