@@ -4,7 +4,7 @@ Every [T3 Code](https://t3.codes) thread in worktree mode gets its own git workt
 turn each worktree into its own isolated dev instance, so several agents can run the backend and
 frontends at the same time without fighting over ports, the database or the login cookie.
 
-**Linux only for now** — see [macOS](#requirements).
+Works on Linux and macOS (macOS tested in CI only, via Homebrew Postgres; Docker Desktop not tested).
 
 Per worktree you get:
 
@@ -26,23 +26,26 @@ Per worktree you get:
 
 ## Requirements
 
-Linux, bash 4.4+, git, Docker with the dev Postgres in a container, Python 3 for `wt`.
+bash, git, Docker with the dev Postgres in a container, Python 3 for `wt`.
 
-> [!WARNING]
-> **macOS is not supported yet.** The scripts rely on Linux-only tools, and some parts would fail
-> *silently* on a Mac rather than with an error. Don't use them on macOS until they are ported.
+The scripts detect the OS themselves.
 
-| Linux dependency | Used for | On macOS |
-| --- | --- | --- |
-| `flock` | slot allocation lock | missing: `setup` aborts |
-| `sha1sum` | worktree id hash | missing (`shasum` instead): `setup` aborts |
-| `/proc/<pid>/cwd` | finding a worktree's dev servers (`stop`, `settle`, `teardown`, `wt status`) | missing: `stop` finds nothing and reports success while servers keep running |
-| `ss` | which slot ports are listening | missing: `teardown` can't see running servers and drops the DB under them |
-| `ip` | LAN IPs for CORS origins | missing: only localhost origins (harmless) |
-| bash 3.2 (macOS default) | | empty arrays under `set -u` abort; needs Homebrew bash |
+- **Linux**: uses `/proc`, `ss`, `ip`, `flock` and `sha1sum` (all standard).
+- **macOS** (12.3+): uses the built-in `lsof`, `ps`, `ifconfig` and `shasum`, and a `mkdir` lock instead of
+  `flock`. The stock `/bin/bash` 3.2 works; Homebrew bash is fine too. `lsof` only sees your own
+  processes, so a server another user started on a slot port is not detected.
+- `wt` assumes T3 Code keeps its state in `~/.t3/userdata` on macOS too (unverified).
 
-With Homebrew's `flock` and `coreutils` installed, `setup` gets through, and the silent failures
-in the `/proc` and `ss` rows are what's left. A port means swapping those calls for `lsof`/`ps`.
+## Tests
+
+```bash
+tests/run.sh                         # needs Docker (or WT_TEST_PG=local with initdb/pg_ctl on PATH)
+WT_TEST_FORCE_OS=Darwin tests/run.sh # the macOS code paths, run on Linux
+```
+
+It builds a throwaway repo with worktrees in a temp dir and starts its own Postgres (container
+`wt-test-postgres`, databases `wttest_*`, ports 23100+), so it never touches your real projects.
+CI runs it on Ubuntu and macOS (`.github/workflows/test.yml`), plus shellcheck.
 
 ## Install
 
