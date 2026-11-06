@@ -26,15 +26,19 @@ Per worktree you get:
 
 ## Requirements
 
-bash, git, Docker with the dev Postgres in a container, Python 3 for `wt`.
+The scripts detect the OS and check these tools before each command; a missing one is named with
+the package that provides it.
 
-The scripts detect the OS themselves.
+- **Both**: bash 3.2+, git 2.31+, Docker with the dev Postgres in a container, awk, sed, grep, ps;
+  Python 3.9+ for `wt`.
+- **Linux**: `flock` (util-linux), `ss` (iproute2), `sha1sum`, `readlink` (coreutils); optional
+  `ip` (iproute2) for LAN IPs in CORS origins.
+- **macOS**: `lsof`, `shasum`, `perl` (takes the slot lock), all built in; optional `ifconfig`. The
+  stock `/bin/bash` 3.2 works. `lsof` only sees your own processes, so a server another user
+  started on a slot port is not detected.
 
-- **Linux**: uses `/proc`, `ss`, `ip`, `flock` and `sha1sum` (all standard).
-- **macOS** (12.3+): uses the built-in `lsof`, `ps`, `ifconfig` and `shasum`, and a `mkdir` lock instead of
-  `flock`. The stock `/bin/bash` 3.2 works; Homebrew bash is fine too. `lsof` only sees your own
-  processes, so a server another user started on a slot port is not detected.
-- `wt` assumes T3 Code keeps its state in `~/.t3/userdata` on macOS too (unverified).
+`help` needs none of them; `describe`, `info` and `list` run without Docker. `wt` assumes T3 Code
+keeps its state in `~/.t3/userdata` on macOS too (unverified).
 
 ## Tests
 
