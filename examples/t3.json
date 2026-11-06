@@ -1,0 +1,21 @@
+{
+    "$schema": "https://t3.codes/schema/t3.json",
+    "defaultThreadEnvMode": "worktree",
+    "scripts": [
+        { "name": "Setup", "command": "scripts/worktree/wt.sh setup", "icon": "configure", "runOnWorktreeCreate": true, "async": false },
+        { "name": "Info", "command": "scripts/worktree/wt.sh info", "icon": "debug" },
+        { "name": "Backend", "command": "scripts/worktree/wt.sh backend", "icon": "play" },
+        { "name": "Frontend", "command": "scripts/worktree/wt.sh frontend", "icon": "play" },
+        { "name": "Lint", "command": "pnpm lint 2>&1 | tail -80", "icon": "lint" },
+        { "name": "Tests", "command": "pnpm test 2>&1 | tail -200", "icon": "test" },
+        { "name": "Pending migrations", "command": "scripts/worktree/wt.sh migrations", "icon": "debug" },
+        { "name": "DB psql", "command": "scripts/worktree/wt.sh db psql", "icon": "debug" },
+        { "name": "DB reset", "command": "scripts/worktree/wt.sh db reset", "icon": "configure" },
+        { "name": "DB reset (fresh snapshot)", "command": "scripts/worktree/wt.sh db reset --fresh", "icon": "configure" },
+        { "name": "List worktree instances", "command": "scripts/worktree/wt.sh list", "icon": "debug" },
+        { "name": "Prune removed worktrees", "command": "scripts/worktree/wt.sh prune", "icon": "configure" },
+        { "name": "Stop servers", "command": "scripts/worktree/wt.sh stop", "icon": "configure" },
+        { "name": "Settle: stop servers", "command": "scripts/worktree/wt.sh settle", "icon": "configure", "runOnSettle": true },
+        { "name": "Teardown", "command": "scripts/worktree/wt.sh teardown --stop", "icon": "configure" }
+    ]
+}

@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+"""wt: overview and cleanup of worktree dev instances across all projects.
+
+  wt status [FILTER] [--all] [--json]      every worktree: slot, T3 thread, agent, servers, RAM, git, verdict
+  wt stop TARGET… | --suggested      stop dev servers + own containers (data kept)
+  wt teardown TARGET… [--stop] | --suggested
+                                     drop DB + own resources, free the slot (code and branch stay)
+  wt gc [--dry-run]                  run every project's prune (orphaned DBs/containers of removed worktrees)
+  wt sync [--check]                  copy wt-lib.sh from here into every project checkout that vendors it
+
+TARGET: worktree path, dir name (t3-1234abcd), branch, or part of the T3 thread title.
+Projects come from T3 Code's project list plus ~/.config/wt/projects (one path per line).
+"""
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parent / "wt-lib.sh"
+T3_DB = Path.home() / ".t3/userdata/statev2.sqlite"
+EXTRA_PROJECTS = Path.home() / ".config/wt/projects"
+SCRIPT_CANDIDATES = ["scripts/worktree/wt.sh", "tools/worktree/wt.sh", "scripts/wt.sh"]
+SHELLS = {"bash", "zsh", "sh", "fish", "tmux: server", "tmux: client"}
+AGENTS = {"claude", "codex"}
+STALE_HOURS = 12
+
+C = sys.stdout.isatty()
+def color(s, code): return f"\033[{code}m{s}\033[0m" if C else s
+def run(cmd, cwd=None, check=False):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode:
+        raise RuntimeError(r.stderr.strip())
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+@dataclass
+class Worktree:
+    project: str
+    path: str
+    main_root: str
+    is_main: bool
+    exists: bool = True
+    branch: str = ""
+    slot: str = ""
+    db: str = ""
+    engine: str = ""          # wt.sh that sources wt-lib.sh, used for stop/teardown
+    legacy: str = ""          # the worktree's own (pre-engine) wt.sh
+    thread: dict = field(default_factory=dict)
+    pids: list = field(default_factory=list)
+    agent_pids: list = field(default_factory=list)
+    rss_kb: int = 0
+    ports: list = field(default_factory=list)
+    containers: list = field(default_factory=list)
+    container_mb: float = 0
+    dirty: int = 0
+    ahead: str = ""
+    merged: bool = False
+    last_commit_h: float = 0
+    verdict: str = ""
+    reason: str = ""
+
+
+# --- discovery -------------------------------------------------------------------------------------
+
+TITLES = {}
+
+def t3_projects():
+    roots = []
+    if T3_DB.exists():
+        try:
+            con = sqlite3.connect(f"file:{T3_DB}?mode=ro", uri=True)
+            for root, title in con.execute(
+                    "select workspace_root, title from projection_projects where deleted_at is null"):
+                roots.append(root)
+                TITLES[root] = title
+        except sqlite3.Error:
+            pass
+    if EXTRA_PROJECTS.exists():
+        roots += [os.path.expanduser(l.strip()) for l in EXTRA_PROJECTS.read_text().splitlines() if l.strip()]
+    out = []
+    for r in roots:
+        if os.path.isdir(os.path.join(r, ".git")) and r not in out:
+            out.append(r)
+    return out
+
+
+def t3_threads():
+    """worktreePath -> newest thread (title, state, updated)."""
+    if not T3_DB.exists():
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{T3_DB}?mode=ro", uri=True)
+        rows = con.execute(
+            "select title, updated_at, archived_at, deleted_at, payload_json from orchestration_v2_projection_threads")
+    except sqlite3.Error:
+        return {}
+    best = {}
+    for title, updated, archived, deleted, payload in rows:
+        p = json.loads(payload or "{}")
+        wt = p.get("worktreePath")
+        if not wt:
+            continue
+        state = "deleted" if deleted else "archived" if archived else \
+            "settled" if (p.get("settledAt") and p.get("settledOverride") is not False) else "open"
+        t = {"title": title or "", "state": state, "updated": updated or "", "id": p.get("id", "")}
+        cur = best.get(wt)
+        # Prefer a live thread over deleted/archived ones, then the most recent.
+        rank = lambda x: (x["state"] in ("open", "settled"), x["updated"])
+        if not cur or rank(t) > rank(cur):
+            best[wt] = t
+    return best
+
+
+def is_engine(script):
+    try:
+        return "wt-lib.sh" in Path(script).read_text()
+    except OSError:
+        return False
+
+
+def project_engine(main_root):
+    """The main checkout's engine-based wt.sh, else any engine-based checkout of the project: it
+    drives legacy worktrees too (it reads their old state files)."""
+    script = find_script(main_root)
+    if is_engine(script):
+        return script
+    for w in worktrees_of(main_root):
+        s = find_script(w["path"]) if os.path.isdir(w["path"]) else ""
+        if is_engine(s):
+            return s
+    return ""
+
+
+def find_script(root):
+    for c in SCRIPT_CANDIDATES:
+        p = os.path.join(root, c)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def worktrees_of(main_root):
+    out, cur = [], {}
+    for line in run(["git", "-C", main_root, "worktree", "list", "--porcelain"]).splitlines() + [""]:
+        if not line:
+            if cur:
+                out.append(cur)
+            cur = {}
+        elif line.startswith("worktree "):
+            cur["path"] = line[9:]
+        elif line.startswith("branch "):
+            cur["branch"] = line[7:].removeprefix("refs/heads/")
+    return out
+
+
+def read_state(path):
+    f = os.path.join(path, ".worktree/env")
+    kv = {}
+    try:
+        for line in Path(f).read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k] = v
+    except OSError:
+        return "", ""
+    slot = kv.get("SLOT") or kv.get("WT_SLOT", "")
+    return slot, kv.get("DB", "")
+
+
+def collect():
+    threads = t3_threads()
+    wts = []
+    for main_root in t3_projects():
+        project = TITLES.get(main_root) or os.path.basename(main_root)
+        main_script = find_script(main_root)
+        engine_main = project_engine(main_root)
+        for w in worktrees_of(main_root):
+            path = w["path"]
+            wt = Worktree(project=project, path=path, main_root=main_root, is_main=path == main_root,
+                          exists=os.path.isdir(path), branch=w.get("branch", ""))
+            if not wt.exists:
+                if main_script:
+                    wts.append(wt)
+                continue
+            own = find_script(path)
+            wt.legacy = own
+            wt.engine = own if is_engine(own) else engine_main
+            if not (own or engine_main) and not wt.is_main:
+                continue  # project without worktree tooling: still listed below via processes
+            wt.slot, wt.db = ("0", "") if wt.is_main else read_state(path)
+            wt.thread = threads.get(path, {})
+            wts.append(wt)
+    return wts
+
+
+# --- runtime facts -----------------------------------------------------------------------------------
+
+def worktrees_dir():
+    try:
+        d = json.loads((Path.home() / ".t3/userdata/settings.json").read_text()).get("worktreesDirectory")
+    except (OSError, ValueError):
+        d = None
+    return os.path.expanduser(d or "~/dev/worktrees")
+
+
+def scan_processes(wts):
+    """Assign processes to worktrees by cwd; servers in deleted worktrees become 'orphan' rows."""
+    roots = sorted((w for w in wts if w.exists), key=lambda w: -len(w.path))
+    wdir = worktrees_dir().rstrip("/") + "/"
+    orphans = {}
+    by_pid = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            raw = os.readlink(f"/proc/{d}/cwd")
+            cwd = raw.removesuffix(" (deleted)")
+            comm = Path(f"/proc/{d}/comm").read_text().strip()
+            rss = 0
+            for line in Path(f"/proc/{d}/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1])
+        except OSError:
+            continue
+        for w in roots:
+            if cwd == w.path or cwd.startswith(w.path + "/"):
+                pid = int(d)
+                if comm in AGENTS:
+                    w.agent_pids.append(pid)
+                elif comm not in SHELLS:
+                    w.pids.append(pid)
+                    w.rss_kb += rss
+                by_pid[pid] = w
+                break
+        else:
+            gone = raw.endswith(" (deleted)") or not os.path.isdir(cwd)
+            if comm not in SHELLS and comm not in AGENTS and cwd.startswith(wdir) and gone:
+                root = wdir + "/".join(cwd[len(wdir):].split("/")[:2])
+                w = orphans.get(root)
+                if not w:
+                    w = orphans[root] = Worktree(project="(deleted)", path=root, main_root="", is_main=False, exists=False)
+                w.pids.append(int(d))
+                w.rss_kb += rss
+                by_pid[int(d)] = w
+    wts.extend(orphans.values())
+    # Listening ports → owning worktree.
+    for line in run(["ss", "-Hltnp"]).splitlines():
+        m = re.search(r":(\d+)\s.*pid=(\d+)", line)
+        if m and int(m.group(2)) in by_pid:
+            w = by_pid[int(m.group(2))]
+            if m.group(1) not in w.ports:
+                w.ports.append(m.group(1))
+
+
+def scan_containers(wts):
+    fmt = '{{.Names}}\t{{.Label "wt.root"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}'
+    rows = [l.split("\t") for l in run(["docker", "ps", "-a", "--format", fmt]).splitlines()]
+    mem = {}
+    for line in run(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"]).splitlines():
+        name, usage = line.split("\t")
+        m = re.match(r"([\d.]+)(\w+)", usage)
+        if m:
+            mem[name] = float(m.group(1)) * {"B": 1e-6, "KiB": 1 / 1024, "kB": 1e-3, "MiB": 1, "MB": 1, "GiB": 1024, "GB": 1000}.get(m.group(2), 0)
+    roots = sorted((w for w in wts if w.exists and not w.is_main), key=lambda w: -len(w.path))
+    for name, label_root, workdir, state in rows:
+        for w in roots:
+            if label_root == w.path or workdir == w.path or workdir.startswith(w.path + "/"):
+                w.containers.append(name + ("" if state == "running" else f"({state})"))
+                w.container_mb += mem.get(name, 0)
+                break
+
+
+def scan_git(w):
+    if not w.exists:
+        return
+    w.dirty = len([l for l in run(["git", "-C", w.path, "status", "--porcelain"]).splitlines() if l])
+    track = run(["git", "-C", w.path, "for-each-ref", "--format=%(upstream:track)", f"refs/heads/{w.branch}"]) if w.branch else ""
+    ahead = run(["git", "-C", w.path, "rev-list", "--count", "@{u}..HEAD"])
+    w.ahead = "gone" if "gone" in track else (ahead or ("-" if w.branch else "detached"))
+    default = run(["git", "-C", w.path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) or "origin/main"
+    w.merged = w.ahead == "gone" or subprocess.run(
+        ["git", "-C", w.path, "merge-base", "--is-ancestor", "HEAD", default], capture_output=True).returncode == 0
+    ts = run(["git", "-C", w.path, "log", "-1", "--format=%ct"])
+    w.last_commit_h = (time.time() - int(ts)) / 3600 if ts else 0
+
+
+def judge(w):
+    state = w.thread.get("state", "")
+    running = bool(w.pids or w.containers and any("(" not in c for c in w.containers))
+    if not w.exists and w.pids:
+        w.verdict, w.reason = "gc", "servers of a deleted worktree — wt gc stops them"
+    elif not w.exists:
+        w.verdict, w.reason = "gc", "dir gone — wt gc drops its DB"
+    elif w.is_main:
+        w.verdict, w.reason = "main", ""
+    elif w.agent_pids:
+        w.verdict, w.reason = "active", "agent running"
+    elif running and state in ("settled", "archived", "deleted"):
+        w.verdict, w.reason = "stop", f"thread {state}"
+    elif running and idle_hours(w) > STALE_HOURS:
+        w.verdict, w.reason = "stop", f"no activity for {int(idle_hours(w))}h, no agent"
+    elif running:
+        w.verdict, w.reason = "running", "no agent"
+    elif w.slot and (state in ("archived", "deleted") or w.merged):
+        unpushed = not w.merged and w.ahead not in ("0", "gone")
+        w.verdict = "check" if (w.dirty or unpushed) else "teardown"
+        w.reason = ("merged" if w.merged else f"thread {state}") + (f", {w.dirty} uncommitted" if w.dirty else "") + \
+            (f", unpushed ({w.ahead})" if unpushed else "")
+    else:
+        w.verdict, w.reason = "idle", ""
+
+
+def idle_hours(w):
+    """Hours since the last sign of work: commit, T3 thread update, or a server (re)start."""
+    ages = [w.last_commit_h]
+    if w.thread.get("updated"):
+        try:
+            from datetime import datetime
+            t = datetime.fromisoformat(w.thread["updated"].replace("Z", "+00:00")).timestamp()
+            ages.append((time.time() - t) / 3600)
+        except ValueError:
+            pass
+    if w.pids:
+        ages.append(min(proc_age_h(p) for p in w.pids))
+    return min(ages)
+
+
+_boot = None
+def proc_age_h(pid):
+    global _boot
+    if _boot is None:
+        _boot = time.time() - float(Path("/proc/uptime").read_text().split()[0])
+    try:
+        start = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]) / os.sysconf("SC_CLK_TCK")
+        return (time.time() - _boot - start) / 3600
+    except (OSError, IndexError):
+        return 0
+
+
+def gather(filter_=None):
+    wts = collect()
+    if filter_:
+        f = filter_.lower()
+        wts = [w for w in wts if matches(w, filter_) or f in w.project.lower() or f in os.path.basename(w.main_root).lower()]
+    scan_processes(wts)
+    scan_containers(wts)
+    for w in wts:
+        scan_git(w)
+        judge(w)
+    return wts
+
+
+def matches(w, target):
+    t = target.rstrip("/")
+    return (os.path.abspath(os.path.expanduser(t)) == w.path or os.path.basename(w.path) == t
+            or w.branch == t or (len(t) >= 4 and t.lower() in w.thread.get("title", "").lower()))
+
+
+# --- output ------------------------------------------------------------------------------------------
+
+VERDICT_COLOR = {"stop": "1;33", "teardown": "1;32", "check": "33", "active": "1;36", "running": "36", "gc": "35"}
+
+def gb(kb=0, mb=0):
+    v = kb / 1048576 + mb / 1024
+    return f"{v:.1f}G" if v >= 0.05 else "-"
+
+
+def print_status(wts, show_all=False):
+    hdr = f"{'project':<14} {'worktree':<22} {'slot':>4} {'thread':<34} {'agent':<5} {'RAM':>5} {'ports':<16} {'git':<16} verdict"
+    print(color(hdr, "1"))
+    total, hidden = 0, 0
+    for w in sorted(wts, key=lambda w: (w.project, not w.is_main, w.path)):
+        quiet = w.verdict in ("idle", "main") and not (w.slot and not w.is_main) and not (w.pids or w.agent_pids)
+        if quiet and not show_all:
+            hidden += 1
+            continue
+        name = "(main)" if w.is_main else os.path.basename(w.path)
+        th = w.thread
+        thread = f"{th.get('state', '')[:4]:<4} {th.get('title', '')}"[:34] if th else "-"
+        git = "gone" if not w.exists else \
+            f"{'*' + str(w.dirty) + ' ' if w.dirty else ''}{'merged' if w.merged else ('↑' + w.ahead if w.ahead not in ('0', '-') else 'pushed')} {int(w.last_commit_h)}h"
+        ports = ",".join(w.ports)[:16] or "-"
+        ram = gb(w.rss_kb, w.container_mb)
+        total += w.rss_kb / 1048576 + w.container_mb / 1024
+        v = color(f"{w.verdict:<8}", VERDICT_COLOR.get(w.verdict, "2")) + (f" {w.reason}" if w.reason else "")
+        print(f"{w.project[:14]:<14} {name[:22]:<22} {w.slot or '-':>4} {thread:<34} {'yes' if w.agent_pids else '-':<5} {ram:>5} {ports:<16} {git[:16]:<16} {v}")
+    if hidden:
+        print(color(f"({hidden} idle worktrees without slot hidden; --all shows them)", "2"))
+    print(color(f"\n{total:.1f} GB in worktree processes and containers.", "2"),
+          "stop → `wt stop --suggested`, teardown → `wt teardown --suggested`, gone → `wt gc`")
+
+
+# --- actions -----------------------------------------------------------------------------------------
+
+def resolve(targets, suggested, wts):
+    if suggested:
+        return [w for w in wts if w.verdict == suggested]
+    out = []
+    for t in targets:
+        hits = [w for w in wts if matches(w, t) and not w.is_main]
+        if not hits:
+            sys.exit(f"wt: no worktree matches {t!r}")
+        if len(hits) > 1:
+            sys.exit(f"wt: {t!r} is ambiguous: " + ", ".join(w.path for w in hits))
+        out += hits
+    return out
+
+
+def engine_cmd(w, *args):
+    if w.engine:
+        return subprocess.run([w.engine, *args], cwd=w.path).returncode
+    return None
+
+
+def generic_stop(w):
+    import signal
+    for pid in w.pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    time.sleep(3)
+    for pid in w.pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    running = [c for c in w.containers if "(" not in c]
+    if running:
+        run(["docker", "stop", *running])
+    print(f"[wt] stopped {len(w.pids)} process(es), {len(running)} container(s) in {w.path}")
+
+
+def cmd_stop(args, wts):
+    targets = resolve([a for a in args if not a.startswith("--")], "stop" if "--suggested" in args else None, wts)
+    if not targets:
+        print("[wt] nothing to stop")
+    for w in targets:
+        print(color(f"== {w.project} {os.path.basename(w.path)}", "1"))
+        if w.agent_pids:
+            print(f"[wt] skipped: an agent runs in {w.path}")
+            continue
+        if engine_cmd(w, "stop") is None:
+            generic_stop(w)
+
+
+def cmd_teardown(args, wts):
+    targets = resolve([a for a in args if not a.startswith("--")], "teardown" if "--suggested" in args else None, wts)
+    extra = ["--stop"] if "--stop" in args else []
+    if not targets:
+        print("[wt] nothing to tear down")
+    rc = 0
+    for w in targets:
+        print(color(f"== {w.project} {os.path.basename(w.path)} ({w.branch})", "1"))
+        if w.agent_pids:
+            print(f"[wt] skipped: an agent runs in {w.path}")
+            continue
+        r = engine_cmd(w, "teardown", *extra)
+        if r is None and w.legacy:
+            # Pre-engine script: no --stop, no safety checks of its own.
+            if w.pids:
+                print("[wt] skipped: servers run (legacy script has no --stop; use `wt stop` first)")
+                continue
+            r = subprocess.run([w.legacy, "teardown"], cwd=w.path).returncode
+        rc = rc or (r or 0)
+    sys.exit(rc)
+
+
+def cmd_gc(args):
+    dry = ["--dry-run"] if "--dry-run" in args else []
+    orphans = [w for w in gather() if w.project == "(deleted)"]
+    if orphans:
+        print(color("== servers of deleted worktrees", "1"))
+        for w in orphans:
+            if dry:
+                print(f"[wt] would stop {len(w.pids)} process(es) of {w.path} ({gb(w.rss_kb)}, ports {','.join(w.ports) or '-'})")
+            else:
+                generic_stop(w)
+    for main_root in t3_projects():
+        script = project_engine(main_root) or find_script(main_root)
+        if not script:
+            continue
+        print(color(f"== {TITLES.get(main_root) or os.path.basename(main_root)}", "1"))
+        if is_engine(script):
+            subprocess.run([script, "prune", *dry], cwd=main_root)
+        elif not dry:
+            subprocess.run([script, "prune"], cwd=main_root)
+        else:
+            print("[wt] legacy script: no --dry-run, skipped")
+
+
+def cmd_sync(args):
+    check = "--check" in args
+    src = LIB.read_bytes()
+    stale = 0
+    for main_root in t3_projects():
+        for w in worktrees_of(main_root):
+            script = find_script(w["path"]) if os.path.isdir(w["path"]) else ""
+            if not is_engine(script):
+                continue
+            lib = Path(script).parent / "wt-lib.sh"
+            if lib.exists() and lib.read_bytes() == src:
+                continue
+            stale += 1
+            if check:
+                print(f"stale: {lib}")
+            else:
+                lib.write_bytes(src)
+                print(f"updated: {lib}  (commit it)")
+    if check and stale:
+        sys.exit(1)
+    if not stale:
+        print("[wt] every vendored wt-lib.sh is current")
+
+
+def main():
+    sys.stdout.reconfigure(line_buffering=True)  # keep order with the scripts' own output
+    args = sys.argv[1:]
+    cmd = args.pop(0) if args else "status"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+    elif cmd == "status":
+        flt = next((a for a in args if not a.startswith("--")), None)
+        wts = gather(flt)
+        if "--json" in args:
+            print(json.dumps([w.__dict__ for w in wts], indent=1, default=str))
+        else:
+            print_status(wts, "--all" in args)
+    elif cmd == "stop":
+        cmd_stop(args, gather())
+    elif cmd == "teardown":
+        cmd_teardown(args, gather())
+    elif cmd == "gc":
+        cmd_gc(args)
+    elif cmd == "sync":
+        cmd_sync(args)
+    else:
+        sys.exit(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main()
