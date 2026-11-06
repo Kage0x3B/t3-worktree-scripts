@@ -15,9 +15,12 @@ set up and paste:
 Install the T3 worktree scripts from https://github.com/Kage0x3B/t3-worktree-scripts and set them
 up for this repo:
 
-1. Clone it to ~/dev/t3-worktree-scripts (or `git pull` if it is already there). Symlink
-   wt/wt into ~/.local/bin (or another dir on my PATH) and skill/t3-worktree-setup into
-   ~/.claude/skills/. Run `wt --help` to check the install.
+1. Find where I keep my projects: look for typical dirs (~/dev, ~/projects, ~/code, ~/src,
+   ~/repos, ~/git, ~/workspace, ~/Developer, ~/Documents/GitHub) and check whether a clone
+   of t3-worktree-scripts already exists in one of them. Suggest a location and ask me
+   which directory to use before cloning. If a clone exists, `git pull` it instead.
+   Then symlink wt/wt into ~/.local/bin (or another dir on my PATH) and
+   skill/t3-worktree-setup into ~/.claude/skills/. Run `wt --help` to check the install.
 2. Read the README and the skill, then follow the skill for this repo: survey the apps,
    services, env files, cookies, crons and outbound integrations first and show me what you
    found before writing anything.
