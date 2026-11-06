@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Test-only stand-in for `docker` on machines without Docker (the macOS CI runner), where the test
+# Postgres runs as a local process. Implements just what wt-lib.sh and the tests call:
+#   docker exec [-i|-t|-it] <container> <cmd…>   runs <cmd…> locally
+#   docker start|stop <container>                no-op (prints the name, like docker)
+#   docker ps|stats|inspect|rm|compose …         no-op, no output
+# tests/run.sh puts it first on PATH and sets WT_TEST_SHIM=1; it refuses to run otherwise.
+set -euo pipefail
+
+if [ "${WT_TEST_SHIM:-}" != 1 ]; then
+    echo "docker shim: for tests/run.sh only (set WT_TEST_SHIM=1)" >&2
+    exit 1
+fi
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+    exec)
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -e | -u | -w) shift 2 ;;
+                -*) shift ;;
+                *) break ;;
+            esac
+        done
+        [ $# -ge 2 ] || { echo "docker shim: exec needs a container and a command" >&2; exit 1; }
+        shift # container name: everything runs against the local Postgres
+        exec "$@"
+        ;;
+    start | stop) printf '%s\n' "$@" ;;
+    ps | stats | inspect | rm | compose) ;;
+    *)
+        echo "docker shim: unsupported command: $cmd" >&2
+        exit 1
+        ;;
+esac
