@@ -23,7 +23,7 @@ jobs:
         run: command -v lsof || sudo apt-get install -y lsof
       - name: tests (Docker Postgres)
         run: tests/run.sh
-      - name: tests, macOS code paths (lsof, ps, shasum, mkdir lock) on Linux
+      - name: tests, macOS code paths (lsof, ps, shasum, perl flock) on Linux
         run: WT_TEST_FORCE_OS=Darwin tests/run.sh
 
   macos:
