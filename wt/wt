@@ -31,21 +31,30 @@ SCRIPT_CANDIDATES = ["scripts/worktree/wt.sh", "tools/worktree/wt.sh", "scripts/
 SHELLS = {"bash", "zsh", "sh", "fish", "tmux: server", "tmux: client"}
 AGENTS = {"claude", "codex"}
 STALE_HOURS = 12
-# WT_TEST_FORCE_OS is for the test suite only (runs the macOS code paths on Linux).
-DARWIN = (os.environ.get("WT_TEST_FORCE_OS") or platform.system()) == "Darwin"
+OS = platform.system()
+# Test suite only (tests/run.sh sets both): run the macOS code paths on Linux.
+if os.environ.get("WT_TEST_RUN") == "1" and os.environ.get("WT_TEST_FORCE_OS"):
+    OS = os.environ["WT_TEST_FORCE_OS"]
+DARWIN = OS == "Darwin"
 
 C = sys.stdout.isatty()
 def color(s, code): return f"\033[{code}m{s}\033[0m" if C else s
-def run(cmd, cwd=None, check=False):
+_warned = set()
+def run(cmd, cwd=None, check=False, any_rc=False):
+    """stdout of cmd, "" when it fails (any_rc: stdout whatever the exit code, for lsof, which
+    exits 1 when it could not inspect some processes)."""
     try:
         r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    except FileNotFoundError:  # tool not installed (e.g. no docker on a Mac using local Postgres)
-        if check:
+    except FileNotFoundError:
+        if not DARWIN or check:
             raise
+        if cmd[0] not in _warned:
+            _warned.add(cmd[0])
+            print(f"[wt] {cmd[0]} not found: its information is missing", file=sys.stderr)
         return ""
     if check and r.returncode:
         raise RuntimeError(r.stderr.strip())
-    return r.stdout.strip() if r.returncode == 0 else ""
+    return r.stdout.strip() if r.returncode == 0 or any_rc else ""
 
 
 @dataclass
@@ -246,23 +255,26 @@ def procs_darwin():
             comm = os.path.basename(parts[2].strip().lstrip("-"))
             info[parts[0]] = ("tmux: server" if comm == "tmux" else comm, int(parts[1]) if parts[1].isdigit() else 0)
     pid = None
-    for line in run(["lsof", "-n", "-d", "cwd", "-Fpn"]).splitlines():
+    for line in run(["lsof", "-n", "-d", "cwd", "-Fpn"], any_rc=True).splitlines():
         if line.startswith("p"):
             pid = line[1:]
         elif line.startswith("n") and pid in info:
             comm, rss = info[pid]
-            yield pid, line[1:], line[1:], comm, rss
+            raw = line[1:]
+            yield pid, raw, raw.removesuffix(" (deleted)"), comm, rss
 
 
 def scan_processes(wts):
     """Assign processes to worktrees by cwd; servers in deleted worktrees become 'orphan' rows."""
-    roots = sorted((w for w in wts if w.exists), key=lambda w: -len(w.path))
-    wdir = worktrees_dir().rstrip("/") + "/"
+    # lsof prints physical paths (/private/var/…): on macOS compare against resolved paths.
+    real = os.path.realpath if DARWIN else (lambda p: p)
+    roots = [(w, real(w.path)) for w in sorted((w for w in wts if w.exists), key=lambda w: -len(w.path))]
+    wdir = real(worktrees_dir()).rstrip("/") + "/"
     orphans = {}
     by_pid = {}
     for d, raw, cwd, comm, rss in (procs_darwin() if DARWIN else procs_linux()):
-        for w in roots:
-            if cwd == w.path or cwd.startswith(w.path + "/"):
+        for w, path in roots:
+            if cwd == path or cwd.startswith(path + "/"):
                 pid = int(d)
                 if comm in AGENTS:
                     w.agent_pids.append(pid)
@@ -299,7 +311,7 @@ def listeners_linux():
 
 def listeners_darwin():
     pid = None
-    for line in run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"]).splitlines():
+    for line in run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"], any_rc=True).splitlines():
         if line.startswith("p"):
             pid = int(line[1:])
         elif line.startswith("n") and pid is not None:
@@ -422,7 +434,10 @@ def gather(filter_=None):
 
 def matches(w, target):
     t = target.rstrip("/")
-    return (os.path.abspath(os.path.expanduser(t)) == w.path or os.path.basename(w.path) == t
+    path = os.path.abspath(os.path.expanduser(t))
+    if DARWIN:  # /tmp and /var are symlinks into /private; git reports resolved paths
+        path = os.path.realpath(path)
+    return (path == w.path or os.path.basename(w.path) == t
             or w.branch == t or (len(t) >= 4 and t.lower() in w.thread.get("title", "").lower()))
 
 

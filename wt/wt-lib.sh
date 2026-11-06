@@ -25,17 +25,28 @@
 # Setup exports WT_SETUP_INSTALL / WT_SETUP_BUILD / WT_SETUP_DB (1 or 0) for the hooks.
 #
 # Runs on Linux and macOS (WT_OS = `uname -s`). Linux uses /proc, ss, ip, flock and sha1sum; macOS uses
-# lsof, ps, ifconfig, a mkdir lock and shasum. Works with bash 3.2 (macOS /bin/bash) and later.
+# lsof, ps, ifconfig, perl (for flock(2)) and shasum. Works with bash 3.2 (macOS /bin/bash) and later.
+# wt_main checks the tools a command needs first (wt_preflight) and lists every missing one.
 
 WT_LIB_VERSION=2
-# WT_TEST_FORCE_OS is for the test suite only (runs the macOS code paths on Linux).
-WT_OS="${WT_TEST_FORCE_OS:-$(uname -s)}"
 
 # --- basics --------------------------------------------------------------------------------------
 
 log() { printf '\033[1;36m[wt]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[wt]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[wt]\033[0m %s\n' "$*" >&2; exit 1; }
+
+WT_OS="$(uname -s)"
+# Test suite only (tests/run.sh sets both): run the macOS code paths on Linux.
+if [ "${WT_TEST_RUN:-}" = 1 ] && [ -n "${WT_TEST_FORCE_OS:-}" ]; then WT_OS=$WT_TEST_FORCE_OS; fi
+case "$WT_OS" in
+    Linux | Darwin) ;;
+    *) die "unsupported OS: $WT_OS (wt-lib.sh runs on Linux and macOS)" ;;
+esac
+if [ "${BASH_VERSINFO[0]}" -lt 3 ] || { [ "${BASH_VERSINFO[0]}" = 3 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+    die "bash $BASH_VERSION is too old: wt-lib.sh needs bash 3.2 or later"
+fi
+command -v git >/dev/null 2>&1 || die "missing required tool: git"
 
 ROOT="$(git rev-parse --show-toplevel)"
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
@@ -118,42 +129,21 @@ new_id() {
     echo "${name}_$hash"
 }
 
-# macOS has no flock(1): an atomic mkdir lock holding the owner's pid. A lock whose owner is gone
-# (killed before it could clean up) is taken over.
-WT_LOCK_DIR=""
+# macOS has no flock(1): perl takes the same flock(2) lock on the shell's fd 9. The lock belongs to the
+# open file, so it outlives the perl process and ends when the fd is closed or this script exits,
+# exactly like `flock 9` (no stale locks).
 slot_lock_darwin() {
-    local dir="$COMMON_DIR/wt-slots.lock.d" owner i=0
-    while ! mkdir "$dir" 2>/dev/null; do
-        owner=$(cat "$dir/pid" 2>/dev/null || true)
-        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-            warn "removing stale slot lock of pid $owner"
-            rm -rf "$dir"
-            continue
-        fi
-        i=$((i + 1))
-        [ $i -ge 300 ] && die "slot lock $dir held by pid ${owner:-?} for 30s — remove it if that process is gone"
-        sleep 0.1
-    done
-    echo $$ >"$dir/pid"
-    WT_LOCK_DIR=$dir
-    trap slot_unlock_darwin EXIT
-}
-slot_unlock_darwin() {
-    [ -n "$WT_LOCK_DIR" ] && rm -rf "$WT_LOCK_DIR"
-    WT_LOCK_DIR=""
-    trap - EXIT
+    # shellcheck disable=SC2016 # perl code, not shell
+    perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or die "fd 9: $!\n"; flock($f, LOCK_EX) or die "flock: $!\n"' ||
+        die "could not lock $COMMON_DIR/wt-slots.lock"
 }
 
 # Lowest slot not claimed by another live worktree.
 allocate_slot() {
     mkdir -p "$STATE_DIR"
     [ -f "$STATE_FILE" ] && return
-    if [ "$WT_OS" = Darwin ]; then
-        slot_lock_darwin
-    else
-        exec 9>"$COMMON_DIR/wt-slots.lock"
-        flock 9
-    fi
+    exec 9>"$COMMON_DIR/wt-slots.lock"
+    if [ "$WT_OS" = Darwin ]; then slot_lock_darwin; else flock 9; fi
     local used=" " path slot id
     while read -r path; do
         [ "$path" = "$ROOT" ] && continue
@@ -173,7 +163,7 @@ allocate_slot() {
             id="$(new_id)"
             printf 'SLOT=%s\nID=%s\nDB=%s\n' "$slot" "$id" "$WT_DB_PREFIX$id" >"$STATE_FILE"
             log "allocated slot $slot"
-            if [ "$WT_OS" = Darwin ]; then slot_unlock_darwin; else exec 9>&-; fi
+            exec 9>&-
             return
         fi
     done
@@ -422,15 +412,21 @@ worktree_pids() {
     others="$(wt_worktree_paths | grep -vxF "$ROOT" || true)"
     if [ "$WT_OS" = Darwin ]; then
         # Captured first: lsof and awk list themselves, and are gone (no comm) when checked below.
-        local pid cwds
+        # lsof prints physical paths (/private/var/…): compare against physical paths.
+        local pid cwds root_p others_p=""
         cwds="$(proc_cwds_darwin)"
+        root_p="$(cd "$ROOT" 2>/dev/null && pwd -P || printf '%s\n' "$ROOT")"
+        while read -r o; do
+            [ -n "$o" ] && others_p+="$(cd "$o" 2>/dev/null && pwd -P || printf '%s\n' "$o")"$'\n'
+        done <<<"$others"
         while read -r pid cwd; do
             [ -n "$pid" ] || continue
-            [[ "$cwd" == "$ROOT" || "$cwd" == "$ROOT/"* ]] || continue
+            cwd=${cwd% (deleted)}
+            [[ "$cwd" == "$root_p" || "$cwd" == "$root_p/"* ]] || continue
             nested=0
             while read -r o; do
                 [ -n "$o" ] && [[ "$cwd" == "$o" || "$cwd" == "$o/"* ]] && nested=1 && break
-            done <<<"$others"
+            done <<<"$others_p"
             [ $nested = 1 ] && continue
             [[ "$self" == *" $pid "* ]] && continue
             comm=$(proc_comm_darwin "$pid") || continue
