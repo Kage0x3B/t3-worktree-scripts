@@ -54,7 +54,8 @@ MAIN_ROOT="$(dirname "$COMMON_DIR")"
 # Never inherit another instance's identity from the parent shell.
 unset SLOT ID DB WT_SLOT WT_ID
 
-WT_SELF="$(readlink -f "$0")"
+# macOS before 12.3 has no readlink -f: fall back to the script's physical directory.
+WT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s/%s\n' "$(cd "$(dirname "$0")" && pwd -P)" "$(basename "$0")")"
 is_main() { [ "$ROOT" = "$MAIN_ROOT" ]; }
 
 wt_defaults() {
@@ -120,7 +121,8 @@ load_state() {
 # dir name never share a database. Postgres identifiers stop at 63 bytes.
 new_id() {
     local name hash
-    name="$(basename "$ROOT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' '_' | cut -c1-32)"
+    # Byte-wise in the C locale, so GNU and BSD tr/cut give the same name (non-ASCII bytes → _).
+    name="$(basename "$ROOT" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -c '[:lower:][:digit:]\n' '_' | LC_ALL=C cut -c1-32)"
     if [ "$WT_OS" = Darwin ]; then
         hash="$(printf '%s' "$ROOT" | shasum -a 1 | cut -c1-6)"
     else
@@ -150,7 +152,7 @@ allocate_slot() {
         read -r slot _ <<<"$(state_identity "$path")"
         [ -n "$slot" ] && used+="$slot "
     done < <(wt_worktree_paths)
-    for slot in $(seq 1 "$WT_MAX_SLOT"); do
+    for ((slot = 1; slot <= WT_MAX_SLOT; slot++)); do
         if [[ "$used" != *" $slot "* ]]; then
             # A slot whose ports are taken (e.g. a server left from a deleted worktree) is not free.
             local busy
@@ -476,7 +478,7 @@ stop_servers() {
         # shellcheck disable=SC2086
         kill -TERM $pids 2>/dev/null || true
         local i
-        for i in $(seq 1 10); do
+        for ((i = 1; i <= 10; i++)); do
             if [ "$WT_OS" = Darwin ]; then
                 pids="$(for p in $pids; do if kill -0 "$p" 2>/dev/null; then echo "$p"; fi; done | tr '\n' ' ')"
             else

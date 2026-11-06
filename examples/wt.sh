@@ -36,8 +36,9 @@ ENV_FILES=(
     apps/frontend/.env
 )
 
+# readlink -f needs macOS 12.3+; older Macs fall back to $0 (fine unless wt.sh is a symlink).
 # shellcheck source=wt-lib.sh
-. "$(dirname "$(readlink -f "$0")")/wt-lib.sh"
+. "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/wt-lib.sh"
 
 dc() { docker compose -p myapp -f "$MAIN_ROOT/docker-compose.yml" "$@"; }
 
