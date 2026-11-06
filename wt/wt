@@ -17,6 +17,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -598,10 +599,31 @@ def cmd_sync(args):
         print("[wt] every vendored wt-lib.sh is current")
 
 
+HINTS_LINUX = {"ss": "iproute2", "docker": "docker.io / docker"}
+HINTS_DARWIN = {"git": "xcode-select --install", "docker": "Docker Desktop, OrbStack or colima",
+                "lsof": "part of macOS: check PATH", "ps": "part of macOS: check PATH"}
+
+
+def preflight(cmd):
+    """One clear error for an unsupported OS or Python, or missing tools (instead of a traceback)."""
+    if OS not in ("Linux", "Darwin"):
+        sys.exit(f"wt: unsupported OS {OS} (runs on Linux and macOS)")
+    if sys.version_info < (3, 9):
+        sys.exit(f"wt: needs Python 3.9 or later (this is {platform.python_version()})")
+    need, hints = (["git", "docker", "ps", "lsof"], HINTS_DARWIN) if DARWIN else (["git", "docker", "ss"], HINTS_LINUX)
+    if cmd == "sync":
+        need = ["git"]
+    missing = [t for t in need if not shutil.which(t)]
+    if missing:
+        sys.exit(f"wt: missing required tools on {OS}: " + ", ".join(f"{t} ({hints.get(t, t)})" for t in missing))
+
+
 def main():
     sys.stdout.reconfigure(line_buffering=True)  # keep order with the scripts' own output
     args = sys.argv[1:]
     cmd = args.pop(0) if args else "status"
+    if cmd not in ("-h", "--help", "help"):
+        preflight(cmd)
     if cmd in ("-h", "--help", "help"):
         print(__doc__.strip())
     elif cmd == "status":

@@ -3,7 +3,7 @@
 # Postgres runs as a local process. Implements just what wt-lib.sh and the tests call:
 #   docker exec [-i|-t|-it] <container> <cmd…>   runs <cmd…> locally
 #   docker start|stop <container>                no-op (prints the name, like docker)
-#   docker ps|stats|inspect|rm|compose …         no-op, no output
+#   docker ps|stats|inspect|info|rm|compose …    no-op, no output
 # tests/run.sh puts it first on PATH and sets WT_TEST_SHIM=1; it refuses to run otherwise.
 set -euo pipefail
 
@@ -28,7 +28,7 @@ case "$cmd" in
         exec "$@"
         ;;
     start | stop) printf '%s\n' "$@" ;;
-    ps | stats | inspect | rm | compose) ;;
+    ps | stats | inspect | info | rm | compose) ;;
     *)
         echo "docker shim: unsupported command: $cmd" >&2
         exit 1

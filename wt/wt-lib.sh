@@ -256,8 +256,10 @@ pg_ready() { wt_pg pg_isready -U "$WT_PG_USER" -q >/dev/null 2>&1; }
 
 wait_pg() {
     local i
-    for i in $(seq 1 30); do
+    for ((i = 1; i <= 30; i++)); do
         pg_ready && return
+        # Name the real cause instead of waiting 30s for a Docker daemon that is not running.
+        [ $i = 1 ] && ! docker info >/dev/null 2>&1 && die "the Docker daemon is not reachable (docker info failed) — start Docker, then retry"
         sleep 1
     done
     die "postgres ($WT_PG_CONTAINER) did not become ready"
@@ -688,7 +690,56 @@ Shared commands (wt-lib.sh v$WT_LIB_VERSION): setup info list describe stop sett
 EOF
 }
 
+# Package that provides a tool, for the "missing tools" hint.
+wt_tool_hint() {
+    if [ "$WT_OS" = Darwin ]; then
+        case "$1" in
+            docker) echo "Docker Desktop, OrbStack or colima" ;;
+            git) echo "xcode-select --install, or brew install git" ;;
+            lsof | shasum | perl | ifconfig | ps | readlink) echo "part of macOS: check PATH" ;;
+            *) echo "brew install $1" ;;
+        esac
+    else
+        case "$1" in
+            flock) echo "util-linux" ;;
+            ss | ip) echo "iproute2" ;;
+            ps) echo "procps / procps-ng" ;;
+            awk) echo "gawk or mawk" ;;
+            docker) echo "docker.io / docker" ;;
+            sha1sum | readlink | cut | tr | head | wc | sleep | basename | dirname) echo "coreutils" ;;
+            *) echo "$1" ;;
+        esac
+    fi
+}
+
+# Tools a command needs, checked with `command -v` only (no subprocesses): one error naming every
+# missing required tool, one warning for missing optional ones. help needs nothing; describe/info/list
+# only read state and ports, so they run without docker.
+wt_preflight() {
+    local cmd=$1 need opt tool missing="" absent=""
+    case "$cmd" in "" | help | -h | --help) return 0 ;; esac
+    need="git awk sed grep ps cut tr head wc sleep basename dirname"
+    case "$cmd" in describe | info | list) ;; *) need="$need docker" ;; esac
+    if [ "$WT_OS" = Darwin ]; then
+        need="$need lsof shasum perl readlink"
+        opt="ifconfig"
+    else
+        need="$need flock ss sha1sum readlink"
+        opt="ip"
+    fi
+    for tool in $need; do
+        command -v "$tool" >/dev/null 2>&1 || missing="$missing, $tool ($(wt_tool_hint "$tool"))"
+    done
+    for tool in $opt; do
+        command -v "$tool" >/dev/null 2>&1 || absent="$absent $tool"
+    done
+    [ -n "$absent" ] && warn "optional tool missing:$absent (LAN IPs are left out of CORS origins)"
+    [ -z "$missing" ] || die "missing required tools on $WT_OS: ${missing#, } — install them (package in parentheses) and retry"
+    return 0
+}
+
 wt_main() {
+    wt_preflight "${1:-}"
     wt_defaults
     local cmd=${1:-}
     shift || true
