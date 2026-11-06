@@ -1,0 +1,40 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        # Warnings and errors fail the build; info/style notes (e.g. SC2016 in eval'd checks) do not.
+        run: shellcheck -x -P SCRIPTDIR -P wt -S warning wt/wt-lib.sh examples/wt.sh tests/*.sh tests/docker-shim/docker
+      - name: py_compile
+        run: python3 -m py_compile wt/wt
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install lsof
+        run: command -v lsof || sudo apt-get install -y lsof
+      - name: tests (Docker Postgres)
+        run: tests/run.sh
+      - name: tests, macOS code paths (lsof, ps, shasum, mkdir lock) on Linux
+        run: WT_TEST_FORCE_OS=Darwin tests/run.sh
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install Postgres and bash
+        run: |
+          brew install postgresql@16 bash
+          echo "$(brew --prefix postgresql@16)/bin" >> "$GITHUB_PATH"
+      - name: tests (Homebrew bash, local Postgres, docker shim)
+        run: WT_TEST_PG=local WT_TEST_BASH="$(brew --prefix)/bin/bash" "$(brew --prefix)/bin/bash" tests/run.sh
+      - name: tests with /bin/bash 3.2
+        run: WT_TEST_PG=local WT_TEST_BASH=/bin/bash /bin/bash tests/run.sh
