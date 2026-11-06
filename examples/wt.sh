@@ -45,7 +45,7 @@ dc() { docker compose -p myapp -f "$MAIN_ROOT/docker-compose.yml" "$@"; }
 wt_ports() {
     BASE=$((13000 + SLOT * 100))
     BACKEND_PORT=$BASE FRONTEND_PORT=$((BASE + 1))
-    WT_PORTS=(backend=$BACKEND_PORT frontend=$FRONTEND_PORT)
+    WT_PORTS=("backend=$BACKEND_PORT" "frontend=$FRONTEND_PORT")
 }
 
 # Shared services from the main checkout's compose file. Postgres stays shared: each worktree

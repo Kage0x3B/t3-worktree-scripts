@@ -23,8 +23,13 @@
 #   wt_db_cloned (after a worktree DB was (re)cloned), wt_db_extra <sub> (after `db <sub>`),
 #   wt_stop_extra, wt_teardown_extra, wt_gc_extra, wt_describe_extra.
 # Setup exports WT_SETUP_INSTALL / WT_SETUP_BUILD / WT_SETUP_DB (1 or 0) for the hooks.
+#
+# Runs on Linux and macOS (WT_OS = `uname -s`). Linux uses /proc, ss, ip, flock and sha1sum; macOS uses
+# lsof, ps, ifconfig, a mkdir lock and shasum. Works with bash 3.2 (macOS /bin/bash) and later.
 
 WT_LIB_VERSION=2
+# WT_TEST_FORCE_OS is for the test suite only (runs the macOS code paths on Linux).
+WT_OS="${WT_TEST_FORCE_OS:-$(uname -s)}"
 
 # --- basics --------------------------------------------------------------------------------------
 
@@ -105,16 +110,50 @@ load_state() {
 new_id() {
     local name hash
     name="$(basename "$ROOT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' '_' | cut -c1-32)"
-    hash="$(printf '%s' "$ROOT" | sha1sum | cut -c1-6)"
+    if [ "$WT_OS" = Darwin ]; then
+        hash="$(printf '%s' "$ROOT" | shasum -a 1 | cut -c1-6)"
+    else
+        hash="$(printf '%s' "$ROOT" | sha1sum | cut -c1-6)"
+    fi
     echo "${name}_$hash"
+}
+
+# macOS has no flock(1): an atomic mkdir lock holding the owner's pid. A lock whose owner is gone
+# (killed before it could clean up) is taken over.
+WT_LOCK_DIR=""
+slot_lock_darwin() {
+    local dir="$COMMON_DIR/wt-slots.lock.d" owner i=0
+    while ! mkdir "$dir" 2>/dev/null; do
+        owner=$(cat "$dir/pid" 2>/dev/null || true)
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            warn "removing stale slot lock of pid $owner"
+            rm -rf "$dir"
+            continue
+        fi
+        i=$((i + 1))
+        [ $i -ge 300 ] && die "slot lock $dir held by pid ${owner:-?} for 30s — remove it if that process is gone"
+        sleep 0.1
+    done
+    echo $$ >"$dir/pid"
+    WT_LOCK_DIR=$dir
+    trap slot_unlock_darwin EXIT
+}
+slot_unlock_darwin() {
+    [ -n "$WT_LOCK_DIR" ] && rm -rf "$WT_LOCK_DIR"
+    WT_LOCK_DIR=""
+    trap - EXIT
 }
 
 # Lowest slot not claimed by another live worktree.
 allocate_slot() {
     mkdir -p "$STATE_DIR"
     [ -f "$STATE_FILE" ] && return
-    exec 9>"$COMMON_DIR/wt-slots.lock"
-    flock 9
+    if [ "$WT_OS" = Darwin ]; then
+        slot_lock_darwin
+    else
+        exec 9>"$COMMON_DIR/wt-slots.lock"
+        flock 9
+    fi
     local used=" " path slot id
     while read -r path; do
         [ "$path" = "$ROOT" ] && continue
@@ -125,6 +164,7 @@ allocate_slot() {
         if [[ "$used" != *" $slot "* ]]; then
             # A slot whose ports are taken (e.g. a server left from a deleted worktree) is not free.
             local busy
+            # shellcheck disable=SC1007 # ID= and DB= deliberately empty in this subshell
             busy="$(SLOT=$slot ID= DB=; WT_PORTS=(); wt_ports; listening_ports | tr '\n' ' ')"
             if [ -n "$busy" ]; then
                 warn "slot $slot skipped: ports in use ($busy) — 'wt gc' stops servers of deleted worktrees"
@@ -133,7 +173,7 @@ allocate_slot() {
             id="$(new_id)"
             printf 'SLOT=%s\nID=%s\nDB=%s\n' "$slot" "$id" "$WT_DB_PREFIX$id" >"$STATE_FILE"
             log "allocated slot $slot"
-            exec 9>&-
+            if [ "$WT_OS" = Darwin ]; then slot_unlock_darwin; else exec 9>&-; fi
             return
         fi
     done
@@ -179,6 +219,14 @@ copy_from_main() {
 
 # This machine's private LAN IPv4 addresses (docker bridges and VPN tunnels skipped).
 lan_ips() {
+    if [ "$WT_OS" = Darwin ]; then
+        # Skip loopback, VPN tunnels, VM/container bridges and Apple's peer-to-peer links.
+        ifconfig 2>/dev/null |
+            awk '/^[^ \t]/ { iface = $1; sub(/:$/, "", iface) }
+                 $1 == "inet" && iface !~ /^(lo|utun|tun|tap|wg|ipsec|ppp|gif|stf|bridge|vmenet|vnic|feth|awdl|llw|anpi|ap[0-9]|docker|tailscale)/ { print $2 }' |
+            grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' || true
+        return 0
+    fi
     ip -4 -o addr show scope global 2>/dev/null |
         awk '$2 !~ /^(docker|br-|veth|virbr|tun|wg|tailscale|CloudflareWARP)/ { sub(/\/.*/, "", $4); print $4 }' |
         grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' || true
@@ -199,7 +247,7 @@ cors_origins() {
 
 port_of() { # port_of <name>: port of a WT_PORTS entry
     local entry
-    for entry in "${WT_PORTS[@]}"; do
+    for entry in ${WT_PORTS[@]+"${WT_PORTS[@]}"}; do
         [ "${entry%%=*}" = "$1" ] && { echo "${entry#*=}"; return; }
     done
     die "no port named $1"
@@ -330,8 +378,26 @@ self_chain() {
     local pid=$$
     while [ "${pid:-0}" -gt 1 ]; do
         echo "$pid"
-        pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
+        if [ "$WT_OS" = Darwin ]; then
+            pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || break
+        else
+            pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
+        fi
     done
+}
+
+# "pid cwd" of every process we may inspect (macOS: from lsof; Linux reads /proc directly).
+proc_cwds_darwin() {
+    lsof -n -d cwd -Fpn 2>/dev/null | awk '/^p/ { pid = substr($0, 2) } /^n/ { print pid, substr($0, 2) }' || true
+}
+
+# Process name like /proc/<pid>/comm: basename of the executable, login shells' "-" dropped.
+proc_comm_darwin() {
+    local comm
+    comm=$(ps -o comm= -p "$1" 2>/dev/null) || return 1
+    [ -n "$comm" ] || return 1
+    comm=${comm#-}
+    echo "${comm##*/}"
 }
 
 # PIDs of processes working inside this worktree: cwd below $ROOT and not below a nested worktree,
@@ -340,7 +406,11 @@ worktree_pids() {
     local self others p cwd comm o nested
     # Never this script, its ancestors, its own children (subshells, helpers) or the other commands
     # of its pipeline (`wt.sh teardown | tail`: same parent and process group).
-    self=" $(self_chain | tr '\n' ' ') $(ps -eo pid=,ppid=,pgid= | awk -v root=$$ '
+    # shellcheck disable=SC2054 # commas belong to the ps format list
+    local ps_all=(ps -eo pid=,ppid=,pgid=)
+    # shellcheck disable=SC2054
+    [ "$WT_OS" = Darwin ] && ps_all=(ps -A -o pid=,ppid=,pgid=)
+    self=" $(self_chain | tr '\n' ' ') $("${ps_all[@]}" | awk -v root=$$ '
         { parent[$1] = $2; group[$1] = $3 }
         END {
             for (p in parent) {
@@ -350,6 +420,25 @@ worktree_pids() {
             }
         }' | tr '\n' ' ') "
     others="$(wt_worktree_paths | grep -vxF "$ROOT" || true)"
+    if [ "$WT_OS" = Darwin ]; then
+        # Captured first: lsof and awk list themselves, and are gone (no comm) when checked below.
+        local pid cwds
+        cwds="$(proc_cwds_darwin)"
+        while read -r pid cwd; do
+            [ -n "$pid" ] || continue
+            [[ "$cwd" == "$ROOT" || "$cwd" == "$ROOT/"* ]] || continue
+            nested=0
+            while read -r o; do
+                [ -n "$o" ] && [[ "$cwd" == "$o" || "$cwd" == "$o/"* ]] && nested=1 && break
+            done <<<"$others"
+            [ $nested = 1 ] && continue
+            [[ "$self" == *" $pid "* ]] && continue
+            comm=$(proc_comm_darwin "$pid") || continue
+            case "$comm" in bash | zsh | sh | fish | claude | codex | tmux*) continue ;; esac
+            echo "$pid"
+        done <<<"$cwds"
+        return 0
+    fi
     for p in /proc/[0-9]*; do
         cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
         cwd=${cwd% (deleted)}
@@ -370,8 +459,13 @@ worktree_pids() {
 # Slot ports something listens on.
 listening_ports() {
     local entry port open
-    open=" $(ss -Hltn 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | tr '\n' ' ') "
-    for entry in "${WT_PORTS[@]}"; do
+    if [ "$WT_OS" = Darwin ]; then
+        # lsof exits 1 when nothing listens. It only sees sockets of processes we may inspect.
+        open=" $({ lsof -nP -iTCP -sTCP:LISTEN -Fn 2>/dev/null || true; } | awk '/^n/ {n = split($0, a, ":"); print a[n]}' | tr '\n' ' ') "
+    else
+        open=" $(ss -Hltn 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | tr '\n' ' ') "
+    fi
+    for entry in ${WT_PORTS[@]+"${WT_PORTS[@]}"}; do
         port=${entry#*=}
         [[ "$open" == *" $port "* ]] && echo "${entry%%=*}:$port"
     done
@@ -382,12 +476,16 @@ stop_servers() {
     local pids
     pids="$(worktree_pids | tr '\n' ' ')"
     if [ -n "${pids// /}" ]; then
-        log "stopping $(wc -w <<<"$pids") process(es) in $ROOT"
+        log "stopping $(wc -w <<<"$pids" | tr -d ' ') process(es) in $ROOT"
         # shellcheck disable=SC2086
         kill -TERM $pids 2>/dev/null || true
         local i
         for i in $(seq 1 10); do
-            pids="$(for p in $pids; do if [ -d "/proc/$p" ]; then echo "$p"; fi; done | tr '\n' ' ')"
+            if [ "$WT_OS" = Darwin ]; then
+                pids="$(for p in $pids; do if kill -0 "$p" 2>/dev/null; then echo "$p"; fi; done | tr '\n' ' ')"
+            else
+                pids="$(for p in $pids; do if [ -d "/proc/$p" ]; then echo "$p"; fi; done | tr '\n' ' ')"
+            fi
             [ -z "${pids// /}" ] && break
             sleep 0.5
         done
@@ -405,7 +503,7 @@ stop_servers() {
 
 git_report() {
     local dirty ahead branch
-    dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l)
+    dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
     branch=$(git -C "$ROOT" branch --show-current)
     ahead=$(git -C "$ROOT" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
     [ "$dirty" -gt 0 ] && warn "$dirty uncommitted change(s) in $ROOT (kept — teardown never touches code)"
@@ -454,7 +552,7 @@ cmd_info() {
     echo "database  $DB"
     local entry
     local scheme
-    for entry in "${WT_PORTS[@]}"; do
+    for entry in ${WT_PORTS[@]+"${WT_PORTS[@]}"}; do
         scheme=http
         [[ " ${WT_HTTPS_PORTS[*]:-} " == *" ${entry%%=*} "* ]] && scheme=https
         printf '%-9s %s\n' "${entry%%=*}" "$scheme://127.0.0.1:${entry#*=}"
@@ -510,7 +608,7 @@ cmd_describe() {
         echo "slot=$SLOT"
         echo "id=$ID"
         echo "db=$DB"
-        echo "ports=${WT_PORTS[*]}"
+        echo "ports=${WT_PORTS[*]:-}"
         echo "listening=$(listening_ports | tr '\n' ' ' | sed 's/ $//')"
     else
         echo "slot="
@@ -556,7 +654,7 @@ cmd_teardown() {
     with_pg_end
     if declare -F wt_teardown_extra >/dev/null; then wt_teardown_extra; fi
     local file
-    for file in "${WT_GENERATED_FILES[@]}"; do rm -f "${ROOT:?}/$file"; done
+    for file in ${WT_GENERATED_FILES[@]+"${WT_GENERATED_FILES[@]}"}; do rm -f "${ROOT:?}/$file"; done
     rm -rf "${STATE_DIR:?}"
     log "slot $SLOT released"
 }
