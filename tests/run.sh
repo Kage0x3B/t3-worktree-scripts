@@ -32,9 +32,16 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=wt-test GIT_AUTHOR_EMAIL=wt-test@example.invalid
 export GIT_COMMITTER_NAME=wt-test GIT_COMMITTER_EMAIL=wt-test@example.invalid
 unset SLOT ID DB WT_SLOT WT_ID
+# Lets wt-lib.sh and wt honour WT_TEST_FORCE_OS (ignored outside tests).
+export WT_TEST_RUN=1
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/wt-test.XXXXXX")"
-TMP="$(cd "$TMP" && pwd -P)" # macOS: /var → /private/var, as git and lsof report it
+# Everything runs below a symlink (as on macOS, where /var and /tmp point into /private): git and
+# lsof report physical paths ($TMP_P/…), the commands are started from the symlinked ones ($TMP/…).
+TMP_BASE="$(mktemp -d "${TMPDIR:-/tmp}/wt-test.XXXXXX")"
+mkdir "$TMP_BASE/real"
+ln -s real "$TMP_BASE/link"
+TMP="$TMP_BASE/link"
+TMP_P="$(cd "$TMP_BASE" && pwd -P)/real"
 OUT="$TMP/out"
 BG_PIDS=""
 PG_MODE=""
@@ -46,14 +53,14 @@ cleanup() {
     local p
     for p in $BG_PIDS; do kill -KILL "$p" 2>/dev/null || true; done
     if [ "${WT_TEST_KEEP:-0}" = 1 ]; then
-        echo "kept: $TMP (postgres: $PG_MODE)"
+        echo "kept: $TMP_BASE (postgres: $PG_MODE)"
         return
     fi
     case "$PG_MODE" in
         docker) docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true ;;
         local) pg_ctl -D "$TMP/pgdata" -m immediate stop >/dev/null 2>&1 || true ;;
     esac
-    rm -rf "$TMP"
+    rm -rf "$TMP_BASE"
     [ -n "$SOCK_DIR" ] && rm -rf "$SOCK_DIR"
 }
 trap cleanup EXIT
@@ -122,7 +129,7 @@ detach() {
 start_server() {
     SERVER_PID=$(detach "$1" python3 -m http.server "$2" --bind 127.0.0.1)
     BG_PIDS="$BG_PIDS $SERVER_PID"
-    for _ in $(seq 1 100); do
+    for ((n = 0; n < 100; n++)); do
         port_open "$2" && return 0
         sleep 0.1
     done
@@ -131,7 +138,7 @@ start_server() {
 }
 
 wait_dead() { # wait_dead <pid>: up to 5s
-    for _ in $(seq 1 50); do
+    for ((n = 0; n < 50; n++)); do
         dead "$1" && return 0
         sleep 0.1
     done
@@ -158,7 +165,7 @@ start_pg_docker() {
     docker run -d --name "$PG_CONTAINER" -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1::5432 \
         "$PG_IMAGE" >/dev/null || return 1
     # Ready over TCP: the image's init server (socket only) is not the final one.
-    for _ in $(seq 1 120); do
+    for ((n = 0; n < 120; n++)); do
         docker exec "$PG_CONTAINER" pg_isready -h 127.0.0.1 -U postgres -q >/dev/null 2>&1 && return 0
         sleep 0.5
     done
@@ -192,7 +199,8 @@ echo "# wt tests: $(uname -s)${WT_TEST_FORCE_OS:+ (forced $WT_TEST_FORCE_OS path
 
 # --- fixture repo -----------------------------------------------------------------------------------
 
-REPO="$TMP/repo" WT1="$TMP/wt1" WT2="$TMP/wt2" WT3="$TMP/wt3"
+REPO="$TMP/repo" WT1="$TMP/wt1" WT2="$TMP/wt2" WT3="$TMP/wt3" WT4="$TMP/wt4"
+REPO_P="$TMP_P/repo" WT1_P="$TMP_P/wt1" WT3_P="$TMP_P/wt3"
 export WT_TEST_DIR="$TMP/fixture"
 mkdir -p "$WT_TEST_DIR" "$REPO/scripts/worktree" "$REPO/apps/backend/src/migrations" "$REPO/apps/frontend"
 
@@ -243,24 +251,32 @@ pgq postgres "CREATE DATABASE wttest_main" >/dev/null &&
 
 # --- new_id: same ids as the original Linux implementation --------------------------------------------
 
-ref_id() { # the pre-port implementation (sha1sum, or python's sha1 where sha1sum is missing)
+ref_id_sh() { # the pre-port implementation, verbatim (GNU tr/cut and sha1sum: Linux only)
     local name hash
     name="$(basename "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' '_' | cut -c1-32)"
-    if command -v sha1sum >/dev/null; then
-        hash="$(printf '%s' "$1" | sha1sum | cut -c1-6)"
-    else
-        hash="$(python3 -c 'import hashlib, sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:6])' "$1")"
-    fi
+    hash="$(printf '%s' "$1" | sha1sum | cut -c1-6)"
     echo "${name}_$hash"
 }
+ref_id_py() { # the same, byte by byte in python (checked against ref_id_sh on Linux)
+    python3 -c 'import hashlib, os, sys
+p = os.fsencode(sys.argv[1])
+name = bytes(c + 32 if 65 <= c <= 90 else c for c in os.path.basename(p))
+name = bytes(c if 97 <= c <= 122 or 48 <= c <= 57 or c == 10 else 95 for c in name)[:32]
+print(name.decode() + "_" + hashlib.sha1(p).hexdigest()[:6])' "$1"
+}
+ref_id() { if [ "$(uname -s)" = Linux ]; then ref_id_sh "$1"; else ref_id_py "$1"; fi; }
 lib_id() { # new_id from wt-lib.sh for ROOT=<path> (os: Linux, Darwin or the host's)
     (cd "$REPO" && WT_TEST_FORCE_OS=${2:-${WT_TEST_FORCE_OS:-}} bash -c '. scripts/worktree/wt-lib.sh; ROOT=$1; new_id' _ "$1")
 }
 id_ok=1
-for p in /home/u/dev/worktrees/t3-1a2b3c4d "/tmp/My Repo.Name" /x/a-very-long-directory-name-well-over-thirty-two-chars "$WT1"; do
+for p in /home/u/dev/worktrees/t3-1a2b3c4d "/tmp/My Repo.Name" /x/a-very-long-directory-name-well-over-thirty-two-chars \
+    "/tmp/Ünïcödé Dir ÄÖ" "/tmp/ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ" "$WT1_P"; do
     want=$(ref_id "$p")
+    if [ "$(uname -s)" = Linux ] && [ "$(ref_id_py "$p")" != "$want" ]; then
+        id_ok=0
+        echo "ref_id_py($p) = $(ref_id_py "$p"), want $want" >"$OUT"
+    fi
     for os in "" Darwin; do
-        [ "$os" = "" ] && [ "$(uname -s)" = Darwin ] && continue # no sha1sum path on macOS
         [ "$os" = Darwin ] && ! command -v shasum >/dev/null && continue
         got=$(lib_id "$p" "$os")
         [ "$got" = "$want" ] || { id_ok=0; echo "new_id($p, ${os:-native}) = $got, want $want" >"$OUT"; }
@@ -268,13 +284,21 @@ for p in /home/u/dev/worktrees/t3-1a2b3c4d "/tmp/My Repo.Name" /x/a-very-long-di
 done
 check "new_id matches the original sha1sum implementation" [ $id_ok = 1 ]
 
+# WT_TEST_FORCE_OS alone (a stray export outside the tests) must not switch the code paths.
+os_lib=$(cd "$REPO" && env -u WT_TEST_RUN WT_TEST_FORCE_OS=Bogus bash -c '. scripts/worktree/wt-lib.sh; echo "$WT_OS"' 2>&1)
+os_py=$(env -u WT_TEST_RUN WT_TEST_FORCE_OS=Bogus python3 -c 'import importlib.machinery as m, importlib.util as u, sys
+spec = u.spec_from_loader("wt", m.SourceFileLoader("wt", sys.argv[1]))
+mod = u.module_from_spec(spec); spec.loader.exec_module(mod); print(mod.OS)' "$SRC/wt/wt" 2>&1)
+echo "lib: $os_lib, wt: $os_py" >"$OUT"
+check "WT_TEST_FORCE_OS is ignored outside tests" eval '[ "$os_lib" = "$(uname -s)" ] && [ "$os_py" = "$(uname -s)" ]'
+
 # --- setup ------------------------------------------------------------------------------------------
 
 wt_in "$WT1" setup --no-install --no-build
 check "setup wt1 exits 0" rc_is 0
 DB1=$(state_val "$WT1" DB)
 check "wt1 gets slot 1" [ "$(state_val "$WT1" SLOT)" = 1 ]
-check "state file: id and db" eval '[ "$DB1" = "wttest_wt_$(ref_id "$WT1")" ] && [ "$(state_val "$WT1" ID)" = "$(ref_id "$WT1")" ]'
+check "state file: id and db" eval '[ "$DB1" = "wttest_wt_$(ref_id "$WT1_P")" ] && [ "$(state_val "$WT1" ID)" = "$(ref_id "$WT1_P")" ]'
 check "env copied from main" file_has "$WT1/apps/backend/.env.development" "PORT=13000"
 B="$WT1/apps/backend/.env" F="$WT1/apps/frontend/.env.development.local"
 check "backend env: shifted port" file_has "$B" "PORT=$((PORT_BASE + 100))"
@@ -308,9 +332,48 @@ check "list shows main, slot 1 and 2" eval 'rc_is 0 && grep -q "^0 .*wttest_main
 
 wt_in "$WT1" describe
 check "describe" eval 'rc_is 0 && has "lib_version=2" && has "project=wttest" && has "slot=1" && has "db=$DB1" && has "is_main=0" &&
-    has "ports=backend=$((PORT_BASE + 100)) frontend=$((PORT_BASE + 101))" && has "main_root=$REPO"'
+    has "ports=backend=$((PORT_BASE + 100)) frontend=$((PORT_BASE + 101))" && has "main_root=$REPO_P" && lacks "missing" && lacks "optional tool"'
 wt_in "$REPO" describe
 check "describe in main" eval 'rc_is 0 && has "is_main=1" && has "slot=0" && has "db=wttest_main"'
+
+# --- preflight: missing tools ----------------------------------------------------------------------------
+
+# fake_path <tool…>: a PATH of symlinks to every tool the scripts use, minus the given ones.
+fake_path() {
+    local dir="$TMP/fakebin.$1" t src
+    rm -rf "$dir" && mkdir -p "$dir"
+    for t in bash env git uname readlink dirname basename awk sed grep ps cut tr head tail wc sleep cat \
+        docker flock ss ip sha1sum shasum lsof perl ifconfig python3 sort mkdir rm cp mv touch ln; do
+        case " $* " in *" $t "*) continue ;; esac
+        src=$(command -v "$t" 2>/dev/null) && [ -n "$src" ] && [ "${src#/}" != "$src" ] && ln -s "$src" "$dir/$t"
+    done
+    echo "$dir"
+}
+if [ "$(uname -s)" = Darwin ] || [ "${WT_TEST_FORCE_OS:-}" = Darwin ]; then HIDE="lsof perl"; else HIDE="flock ss"; fi
+FP=$(fake_path $HIDE)
+(cd "$WT1" && PATH="$FP" ./scripts/worktree/wt.sh stop) >"$OUT" 2>&1
+RC=$?
+check "preflight: one error naming every missing tool" eval 'rc_is 1 && has "missing required tools" && has "${HIDE% *} (" && has "${HIDE#* } (" && [ "$(grep -c "missing required" "$OUT")" = 1 ] && lacks "git ("'
+FP=$(fake_path docker)
+(cd "$WT1" && PATH="$FP" ./scripts/worktree/wt.sh describe) >"$OUT" 2>&1
+RC=$?
+check "preflight: describe runs without docker" eval 'rc_is 0 && has "slot=1"'
+(cd "$WT1" && PATH="$FP" ./scripts/worktree/wt.sh stop) >"$OUT" 2>&1
+RC=$?
+check "preflight: stop needs docker" eval 'rc_is 1 && has "docker ("'
+if [ "$(uname -s)" = Darwin ] || [ "${WT_TEST_FORCE_OS:-}" = Darwin ]; then HIDE=ifconfig; else HIDE=ip; fi
+FP=$(fake_path $HIDE)
+(cd "$WT1" && PATH="$FP" ./scripts/worktree/wt.sh describe) >"$OUT" 2>&1
+RC=$?
+check "preflight: missing optional tool only warns" eval 'rc_is 0 && has "optional tool missing: $HIDE" && has "slot=1"'
+if [ "$(uname -s)" = Darwin ] || [ "${WT_TEST_FORCE_OS:-}" = Darwin ]; then HIDE=lsof; else HIDE=ss; fi
+FP=$(fake_path $HIDE)
+HOME="$TMP/home" PATH="$FP" python3 "$SRC/wt/wt" status >"$OUT" 2>&1
+RC=$?
+check "wt preflight: names the missing tool" eval 'rc_is 1 && has "missing required tools" && has "$HIDE ("'
+HOME="$TMP/home" PATH="$FP" python3 "$SRC/wt/wt" --help >"$OUT" 2>&1
+RC=$?
+check "wt --help needs no tools" rc_is 0
 
 wt_in "$WT1" migrations
 check "migrations: none pending" eval 'rc_is 0 && lacks 0001_init'
@@ -362,45 +425,51 @@ check "stop without slot exits 0" rc_is 0
 
 # --- slot reuse and prune -------------------------------------------------------------------------------
 
-(cd "$REPO" && git worktree add -q "$WT3" -b wt3)
-if [ "$(uname -s)" = Darwin ] || [ "${WT_TEST_FORCE_OS:-}" = Darwin ]; then
-    # A lock left by a killed setup (its pid is gone) must not block the next one.
-    sleep 0 &
-    gone=$!
-    wait $gone
-    mkdir -p "$REPO/.git/wt-slots.lock.d" && echo "$gone" >"$REPO/.git/wt-slots.lock.d/pid"
-fi
-wt_in "$WT3" setup --no-install --no-build
+(cd "$REPO" && git worktree add -q "$WT3" -b wt3 && git worktree add -q "$WT4" -b wt4)
+# Two setups at once: the slot lock must hand out the free slot 1 and the next one, 3, once each.
+(cd "$WT3" && ./scripts/worktree/wt.sh setup --no-install --no-build >"$OUT.3" 2>&1) &
+job3=$!
+(cd "$WT4" && ./scripts/worktree/wt.sh setup --no-install --no-build >"$OUT.4" 2>&1) &
+job4=$!
+wait $job3
+RC=$?
+wait $job4
+RC=$((RC + $?))
+cat "$OUT.3" "$OUT.4" >"$OUT"
 # shellcheck disable=SC2034
-DB3=$(state_val "$WT3" DB)
-check "freed slot 1 is reused" eval 'rc_is 0 && [ "$(state_val "$WT3" SLOT)" = 1 ] && db_present "$DB3"'
-check "slot lock released" [ ! -e "$REPO/.git/wt-slots.lock.d" ]
+DB3=$(state_val "$WT3" DB) DB4=$(state_val "$WT4" DB)
+check "parallel setups exit 0" rc_is 0
+check "parallel setups get slots 1 and 3" eval '[ "$(printf "%s\n" "$(state_val "$WT3" SLOT)" "$(state_val "$WT4" SLOT)" | sort | tr "\n" " ")" = "1 3 " ]'
+check "parallel setups get their DBs" eval 'db_present "$DB3" && db_present "$DB4"'
+wt_in "$WT4" teardown
+check "teardown wt4" eval 'rc_is 0 && db_absent "$DB4"'
 
 rm -rf "$WT2"
 wt_in "$REPO" prune --dry-run
-check "prune --dry-run lists only the orphan" eval 'rc_is 0 && has "would drop orphaned $DB2" && lacks "$DB3" && lacks wttest_main && lacks template'
+check "prune --dry-run lists only the orphan" eval 'rc_is 0 && has "would drop orphaned $DB2" && lacks "$DB3" && lacks wttest_main && lacks template && [ "$(grep -c "would drop" "$OUT")" = 1 ]'
 check "prune --dry-run drops nothing" eval 'db_present "$DB2" && db_present "$DB3"'
 wt_in "$REPO" prune
 check "prune drops the orphan only" eval 'rc_is 0 && db_absent "$DB2" && db_present "$DB3" && db_present wttest_main && db_present wttest_wt_template'
 
 # --- wt CLI -----------------------------------------------------------------------------------------------
 
-export_home() { mkdir -p "$TMP/home/.config/wt" && echo "$REPO" >"$TMP/home/.config/wt/projects"; }
+# T3 stores physical paths, as git reports them.
+export_home() { mkdir -p "$TMP/home/.config/wt" && echo "$REPO_P" >"$TMP/home/.config/wt/projects"; }
 export_home
 wt_cli() { HOME="$TMP/home" python3 "$SRC/wt/wt" "$@" >"$OUT" 2>&1; RC=$?; }
 
 wt_cli --help
 check "wt --help" eval 'rc_is 0 && has "wt status"'
-P3=$((PORT_BASE + 100))
+P3=$((PORT_BASE + 100 * $(state_val "$WT3" SLOT)))
 start_server "$WT3" "$P3" || fail "fake server in wt3 started"
 wt_cli status --json
-check "wt status --json" eval 'rc_is 0 && python3 - "$OUT" "$WT3" "$P3" "$SERVER_PID" <<"EOF"
+check "wt status --json" eval 'rc_is 0 && python3 - "$OUT" "$WT3_P" "$P3" "$SERVER_PID" "$(state_val "$WT3" SLOT)" <<"EOF"
 import json, sys
 rows = json.load(open(sys.argv[1]))
 w = [r for r in rows if r["path"] == sys.argv[2]]
 assert w, "wt3 missing"
 w = w[0]
-assert w["slot"] == "1", w
+assert w["slot"] == sys.argv[5], w
 assert int(sys.argv[4]) in w["pids"], w
 assert sys.argv[3] in w["ports"], w
 assert w["verdict"] == "running", w
@@ -408,9 +477,12 @@ assert any(r["is_main"] for r in rows), "main missing"
 EOF'
 wt_cli status --all
 check "wt status (table)" eval 'rc_is 0 && has wt3 && has "(main)"'
-wt_cli stop "$WT3"
+# macOS: the symlinked path must match too (wt resolves it); Linux matches the path as given.
+WT3_ARG=$WT3_P
+if [ "$(uname -s)" = Darwin ] || [ "${WT_TEST_FORCE_OS:-}" = Darwin ]; then WT3_ARG=$WT3; fi
+wt_cli stop "$WT3_ARG"
 check "wt stop <path> stops the server" eval 'rc_is 0 && wait_dead "$SERVER_PID" && port_closed "$P3" && alive "$OUTSIDE1"'
-wt_cli teardown "$WT3"
+wt_cli teardown "$WT3_ARG"
 check "wt teardown <path>" eval 'rc_is 0 && db_absent "$DB3" && [ ! -e "$WT3/.worktree" ]'
 
 # --- summary ----------------------------------------------------------------------------------------------
